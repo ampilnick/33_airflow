@@ -1,0 +1,162 @@
+import logging
+import os
+import dill
+import datetime
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer, make_column_selector
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+# Укажем путь к файлам проекта:
+# -> $PROJECT_PATH при запуске в Airflow
+# -> иначе - текущая директория при локальном запуске
+path = os.environ.get('PROJECT_PATH', '.')
+
+
+def filter_data(df: pd.DataFrame) -> pd.DataFrame:
+    columns_to_drop = [
+        'id',
+        'url',
+        'region',
+        'region_url',
+        'price',
+        'manufacturer',
+        'image_url',
+        'description',
+        'posting_date',
+        'lat',
+        'long'
+    ]
+    return df.drop(columns_to_drop, axis=1)
+
+
+def remove_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    def calculate_outliers(data):
+        q25 = data.quantile(0.25)
+        q75 = data.quantile(0.75)
+        iqr = q75 - q25
+        bounds = (q25 - 1.5 * iqr, q75 + 1.5 * iqr)
+        return bounds
+
+    df = df.copy()
+    boundaries = calculate_outliers(df['year'])
+    df.loc[df['year'] < boundaries[0], 'year'] = round(boundaries[0])
+    df.loc[df['year'] > boundaries[1], 'year'] = round(boundaries[1])
+    return df
+
+
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    def short_model(x):
+        if not pd.isna(x):
+            return x.lower().split(' ')[0]
+        else:
+            return x
+
+    df = df.copy()
+    df.loc[:, 'short_model'] = df['model'].apply(short_model)
+    df.loc[:, 'age_category'] = df['year'].apply(
+        lambda x: 'new' if x > 2013 else ('old' if x < 2006 else 'average'))
+    return df
+
+
+def pipeline() -> None:
+
+    logging.info('Start Pipeline')
+
+    # Опишем пайплайн предобработки
+    numerical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('encoder', OneHotEncoder(handle_unknown='ignore'))
+    ])
+
+    numerical_features = make_column_selector(
+        dtype_include=['int64', 'float64'])
+    categorical_features = make_column_selector(dtype_include=object)
+
+    column_transformer = ColumnTransformer(transformers=[
+        ('numerical', numerical_transformer, numerical_features),
+        ('categorical', categorical_transformer, categorical_features)
+    ])
+
+    preprocessor = Pipeline(steps=[
+        ('filter', FunctionTransformer(filter_data)),
+        ('outlier_remover', FunctionTransformer(remove_outliers)),
+        ('feature_creator', FunctionTransformer(create_features)),
+        ('column_transformer', column_transformer)
+    ])
+
+    # Загрузка данных
+    df = pd.read_csv(f'{path}/data/train/homework.csv')
+
+    # Предобработка данных
+    X = preprocessor.fit_transform(df.drop('price_category', axis=1))
+    y = df['price_category']
+
+    # Модели для выбора лучшей
+    models = [
+        LogisticRegression(solver='liblinear'),
+        RandomForestClassifier(),
+        SVC()
+    ]
+
+    # Выбор лучшей модели
+    best_score = .0
+    best_model = None
+    for model in models:
+        # Кросс-валидация текущей модели
+        score = cross_val_score(model, X, y, cv=4, scoring='accuracy',
+                                n_jobs=-1)
+
+        logging.info(f'model: {type(model).__name__}, acc_mean: \
+{score.mean():.4f}, acc_std: {score.std():.4f}')
+
+        if score.mean() > best_score:
+            best_score = score.mean()
+            best_model = model
+
+    logging.info(f'best model: {type(best_model).__name__}, accuracy: \
+{best_score:.4f}')
+
+    # Фит лучшей модели
+    best_model.fit(X, y)
+
+    # Пайплайн с лучшей моделью
+    best_pipe = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', best_model)
+    ])
+
+    # Имя модели постоянно чтобы новая модель затирала старую
+    model_filename = f'{path}/data/models/cars_pipe.pkl'
+
+    # Сохраним лучшую модель с метаданными
+    with open(model_filename, 'wb') as file:
+        dill.dump({
+            'pipeline': best_pipe,
+            'metadata': {
+                'name': 'Car price prediction model',
+                'author': 'Nikolay Ampilogov',
+                'version': 1,
+                'date': datetime.datetime.now(),
+                'type': type(best_pipe.named_steps['classifier']).__name__,
+                'accuracy': best_score}
+            }, file)
+
+    logging.info(f'Model is saved as {model_filename}')
+
+
+if __name__ == '__main__':
+    pipeline()
